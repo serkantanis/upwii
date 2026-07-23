@@ -34,6 +34,35 @@ def parse_args() -> argparse.Namespace:
         default=8080,
         help="Web server TCP port (default: 8080)",
     )
+    parser.add_argument(
+        "--no-camera",
+        action="store_true",
+        help="Disable the Raspberry Pi camera in web mode",
+    )
+    parser.add_argument(
+        "--camera-width",
+        type=int,
+        default=1280,
+        help="Camera stream width (default: 1280)",
+    )
+    parser.add_argument(
+        "--camera-height",
+        type=int,
+        default=720,
+        help="Camera stream height (default: 720)",
+    )
+    parser.add_argument(
+        "--camera-fps",
+        type=int,
+        default=30,
+        help="Camera stream frame rate (default: 30)",
+    )
+    parser.add_argument(
+        "--camera-quality",
+        type=int,
+        default=85,
+        help="MJPEG quality from 1 to 100 (default: 85)",
+    )
     return parser.parse_args()
 
 
@@ -49,6 +78,11 @@ def main() -> int:
                 args.demo,
                 args.host,
                 args.http_port,
+                not args.no_camera,
+                args.camera_width,
+                args.camera_height,
+                args.camera_fps,
+                args.camera_quality,
             )
 
         from imu_nav.app import run_gui

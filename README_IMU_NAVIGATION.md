@@ -54,6 +54,16 @@ python3 imu_navigation.py --web --port /dev/ttyUSB0
 
 For an ESP32 that appears as an ACM serial device, use `/dev/ttyACM0`. If
 `--port` is omitted, the first USB/ACM serial device is selected automatically.
+The web screen also starts camera 0 with `rpicam-vid` and embeds its MJPEG stream.
+The default is 1280x720 at 30 FPS:
+
+```bash
+python3 imu_navigation.py --web --port /dev/ttyACM0 \
+  --camera-width 1280 --camera-height 720 --camera-fps 30
+```
+
+Use `--camera-quality 70` to reduce network traffic, or `--no-camera` to run
+only the IMU dashboard. Camera failure does not stop telemetry.
 
 Open the address printed by the program from a phone or computer on the same
 network, normally:

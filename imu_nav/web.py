@@ -6,7 +6,9 @@ from collections import deque
 import json
 import math
 import queue
+import shutil
 import socket
+import subprocess
 import threading
 import time
 from http import HTTPStatus
@@ -28,6 +30,144 @@ from .protocol import (
 
 
 EventQueue = queue.Queue[tuple[str, Any]]
+
+
+class CameraStream(threading.Thread):
+    """Capture one MJPEG stream and share its latest frame with all clients."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fps: int,
+        quality: int,
+    ) -> None:
+        super().__init__(daemon=True, name="rpicam-capture")
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.quality = quality
+        self.condition = threading.Condition()
+        self.stop_event = threading.Event()
+        self.process: subprocess.Popen[bytes] | None = None
+        self.frame: bytes | None = None
+        self.sequence = 0
+        self.last_frame_at = 0.0
+        self.status = "Kamera başlatılıyor"
+
+    def run(self) -> None:
+        executable = shutil.which("rpicam-vid")
+        if not executable:
+            with self.condition:
+                self.status = "rpicam-vid bulunamadı"
+                self.condition.notify_all()
+            return
+
+        command = [
+            executable,
+            "--camera",
+            "0",
+            "--width",
+            str(self.width),
+            "--height",
+            str(self.height),
+            "--framerate",
+            str(self.fps),
+            "--codec",
+            "mjpeg",
+            "--quality",
+            str(self.quality),
+            "--nopreview",
+            "--timeout",
+            "0",
+            "--output",
+            "-",
+        ]
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                bufsize=0,
+            )
+            assert self.process.stdout is not None
+            buffer = bytearray()
+            while not self.stop_event.is_set():
+                chunk = self.process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                buffer.extend(chunk)
+                while True:
+                    start = buffer.find(b"\xff\xd8")
+                    if start < 0:
+                        buffer.clear()
+                        break
+                    end = buffer.find(b"\xff\xd9", start + 2)
+                    if end < 0:
+                        if start:
+                            del buffer[:start]
+                        break
+                    frame = bytes(buffer[start : end + 2])
+                    del buffer[: end + 2]
+                    with self.condition:
+                        self.frame = frame
+                        self.sequence += 1
+                        self.last_frame_at = time.monotonic()
+                        self.status = "Kamera canlı"
+                        self.condition.notify_all()
+        except Exception as exc:
+            with self.condition:
+                self.status = f"Kamera hatası: {exc}"
+                self.condition.notify_all()
+        finally:
+            process = self.process
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                if not self.stop_event.is_set():
+                    with self.condition:
+                        self.status = (
+                            f"Kamera durdu (kod {process.returncode})"
+                        )
+                        self.condition.notify_all()
+
+    def wait_for_frame(
+        self,
+        after_sequence: int,
+        timeout: float = 2.0,
+    ) -> tuple[int, bytes | None]:
+        with self.condition:
+            self.condition.wait_for(
+                lambda: self.sequence != after_sequence or self.stop_event.is_set(),
+                timeout,
+            )
+            return self.sequence, self.frame
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.condition:
+            return {
+                "enabled": True,
+                "online": (
+                    self.frame is not None
+                    and time.monotonic() - self.last_frame_at < 2.0
+                ),
+                "status": self.status,
+                "width": self.width,
+                "height": self.height,
+                "fps": self.fps,
+            }
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        with self.condition:
+            self.condition.notify_all()
+        process = self.process
+        if process is not None and process.poll() is None:
+            process.terminate()
 
 
 class SerialWorker(threading.Thread):
@@ -137,8 +277,13 @@ class DemoWorker(threading.Thread):
 
 
 class WebState:
-    def __init__(self, worker: SerialWorker | DemoWorker) -> None:
+    def __init__(
+        self,
+        worker: SerialWorker | DemoWorker,
+        camera: CameraStream | None,
+    ) -> None:
         self.worker = worker
+        self.camera = camera
         self.events: EventQueue = worker.events
         self.navigator = InertialNavigationEKF()
         self.lock = threading.Lock()
@@ -219,6 +364,15 @@ class WebState:
                     "gaps": stats.sequence_gaps,
                     "discarded": stats.discarded_bytes,
                 },
+                "camera": (
+                    self.camera.snapshot()
+                    if self.camera is not None
+                    else {
+                        "enabled": False,
+                        "online": False,
+                        "status": "Kamera kapalı",
+                    }
+                ),
             }
             if sample is None or solution is None:
                 return result
@@ -246,6 +400,8 @@ class WebState:
     def stop(self) -> None:
         self.stop_event.set()
         self.worker.stop()
+        if self.camera is not None:
+            self.camera.stop()
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -258,10 +414,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             body = json.dumps(self.state.snapshot(), separators=(",", ":")).encode()
             self._send(HTTPStatus.OK, body, "application/json")
+        elif path == "/camera.mjpg":
+            self._stream_camera()
         elif path == "/health":
             self._send(HTTPStatus.OK, b"ok\n", "text/plain")
         else:
             self._send(HTTPStatus.NOT_FOUND, b"not found\n", "text/plain")
+
+    def _stream_camera(self) -> None:
+        camera = self.state.camera
+        if camera is None:
+            self._send(HTTPStatus.NOT_FOUND, b"camera disabled\n", "text/plain")
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header(
+            "Content-Type",
+            "multipart/x-mixed-replace; boundary=frame",
+        )
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        sequence = -1
+        try:
+            while not self.state.stop_event.is_set():
+                next_sequence, frame = camera.wait_for_frame(sequence)
+                if frame is None or next_sequence == sequence:
+                    continue
+                sequence = next_sequence
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(
+                    f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
+                )
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+        except OSError:
+            pass
 
     def do_POST(self) -> None:  # noqa: N802
         if urlparse(self.path).path == "/api/reset":
@@ -316,9 +504,23 @@ def run_web(
     demo: bool,
     host: str,
     http_port: int,
+    camera_enabled: bool = True,
+    camera_width: int = 1280,
+    camera_height: int = 720,
+    camera_fps: int = 30,
+    camera_quality: int = 85,
 ) -> int:
     if not 1 <= http_port <= 65535:
         print("HTTP portu 1-65535 arasında olmalı")
+        return 2
+    if camera_width < 16 or camera_height < 16:
+        print("Kamera genişliği ve yüksekliği en az 16 olmalı")
+        return 2
+    if not 1 <= camera_fps <= 120:
+        print("Kamera FPS değeri 1-120 arasında olmalı")
+        return 2
+    if not 1 <= camera_quality <= 100:
+        print("Kamera kalitesi 1-100 arasında olmalı")
         return 2
     if demo:
         events: EventQueue = queue.Queue(maxsize=10_000)
@@ -331,10 +533,17 @@ def run_web(
         events = queue.Queue(maxsize=10_000)
         worker = SerialWorker(port, baud, events)
 
-    state = WebState(worker)
+    camera = (
+        CameraStream(camera_width, camera_height, camera_fps, camera_quality)
+        if camera_enabled
+        else None
+    )
+    state = WebState(worker, camera)
     DashboardHandler.state = state
     processor = threading.Thread(target=state.run, daemon=True, name="imu-processor")
     processor.start()
+    if camera is not None:
+        camera.start()
     try:
         server = DashboardServer((host, http_port), DashboardHandler)
     except OSError as exc:
@@ -343,6 +552,12 @@ def run_web(
         return 2
 
     print(f"IMU durum ekranı: http://{_local_ip()}:{http_port}")
+    if camera is not None:
+        print(
+            "Kamera: "
+            f"{camera_width}x{camera_height} @ {camera_fps} FPS, "
+            f"MJPEG kalite {camera_quality}"
+        )
     print("Durdurmak için Ctrl+C")
     try:
         server.serve_forever(poll_interval=0.25)
@@ -352,6 +567,8 @@ def run_web(
         server.server_close()
         state.stop()
         processor.join(timeout=1.5)
+        if camera is not None:
+            camera.join(timeout=2.5)
     return 0
 
 
@@ -362,9 +579,11 @@ DASHBOARD_HTML = r"""<!doctype html>
 body{margin:0;background:radial-gradient(circle at 70% -20%,#173647,var(--bg) 45%);font:15px system-ui,sans-serif;color:#edf8ff}.wrap{max-width:1280px;margin:auto;padding:22px}
 header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}h1{font-size:22px;margin:0;letter-spacing:.04em}.badge{padding:7px 12px;border:1px solid var(--line);border-radius:99px;color:var(--muted)}.badge.on{color:var(--green);border-color:#285b3c}
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:linear-gradient(145deg,#12232e,#0c1821);border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0}.wide{grid-column:span 2}.full{grid-column:1/-1}.label{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.1em}.value{font:600 25px ui-monospace,monospace;margin-top:8px;white-space:nowrap}.small{font-size:17px}canvas{width:100%;height:240px;margin-top:8px;display:block}button{background:#193341;color:white;border:1px solid #335364;border-radius:9px;padding:9px 14px;cursor:pointer}.stats{color:var(--muted);font:13px ui-monospace,monospace;margin-top:10px}
+.camera{padding:0;overflow:hidden;position:relative;background:#050a0e;min-height:260px}.camera img{width:100%;height:auto;max-height:70vh;object-fit:contain;display:block}.camera .overlay{position:absolute;left:12px;bottom:12px;padding:6px 9px;border-radius:7px;background:#071018cc;color:var(--muted);font:12px ui-monospace,monospace}
 @media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)}.wide{grid-column:span 2}.value{font-size:20px}}@media(max-width:480px){.wrap{padding:12px}.grid{grid-template-columns:1fr}.wide,.full{grid-column:span 1}}
 </style></head><body><div class="wrap"><header><div><h1>ESP32 · IMU NAVİGASYON</h1><div id="status" class="stats">Bağlanıyor…</div></div><div id="online" class="badge">ÇEVRİMDIŞI</div></header>
 <main class="grid"><section class="card"><div class="label">Örnek hızı</div><div id="rate" class="value">—</div></section><section class="card"><div class="label">Hız</div><div id="speed" class="value">—</div></section><section class="card"><div class="label">Toplam rota</div><div id="distance" class="value">—</div></section><section class="card"><div class="label">Sıcaklık</div><div id="temp" class="value">—</div></section>
+<section id="cameraCard" class="card full camera"><img id="cameraFeed" src="/camera.mjpg" alt="Canlı kamera"><div id="cameraStatus" class="overlay">Kamera başlatılıyor…</div></section>
 <section class="card wide"><div class="label">Konum X / Y / Z</div><div id="position" class="value small">—</div></section><section class="card wide"><div class="label">Hız X / Y / Z</div><div id="velocity" class="value small">—</div></section>
 <section class="card wide"><div class="label">Üstten rota · X/Y</div><canvas id="route"></canvas></section><section class="card wide"><div class="label">Hız geçmişi</div><canvas id="chart"></canvas></section>
 <section class="card wide"><div class="label">Roll / Pitch / Yaw</div><div id="euler" class="value small">—</div></section><section class="card wide"><div class="label">Kalibrasyon</div><div id="cal" class="value small">—</div></section>
@@ -372,6 +591,6 @@ header{display:flex;justify-content:space-between;align-items:center;margin-bott
 <script>
 const $=id=>document.getElementById(id), fmt=(a,n=2,u='')=>a?a.map(x=>(x>=0?'+':'')+x.toFixed(n)).join(' / ')+u:'—';
 function canvas(id,points,color,xy=false){const c=$(id),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;const x=c.getContext('2d');x.scale(d,d);x.clearRect(0,0,w,h);x.strokeStyle='#233746';x.lineWidth=1;x.beginPath();for(let i=1;i<4;i++){x.moveTo(0,h*i/4);x.lineTo(w,h*i/4)}x.stroke();if(!points||points.length<2)return;let data=xy?points.map(p=>[p[0],p[1]]):points.map(p=>[p[0],p[1]]);let xs=data.map(p=>p[0]),ys=data.map(p=>p[1]),xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys);if(xmax===xmin)xmax=xmin+1;if(ymax===ymin)ymax=ymin+1;let pad=18;x.strokeStyle=color;x.lineWidth=2;x.beginPath();data.forEach((p,i)=>{let px=pad+(p[0]-xmin)/(xmax-xmin)*(w-pad*2),py=h-pad-(p[1]-ymin)/(ymax-ymin)*(h-pad*2);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}
-async function update(){try{let r=await fetch('/api/status',{cache:'no-store'}),s=await r.json();$('online').textContent=s.online?'CANLI':'ÇEVRİMDIŞI';$('online').className='badge '+(s.online?'on':'');$('status').textContent=s.status;$('rate').textContent=s.rate_hz.toFixed(1)+' Hz';$('speed').textContent=s.speed_mps==null?'—':s.speed_mps.toFixed(2)+' m/s';$('distance').textContent=s.distance_m==null?'—':s.distance_m.toFixed(2)+' m';$('temp').textContent=s.temperature_c==null?'—':s.temperature_c.toFixed(1)+' °C';$('position').textContent=fmt(s.position,2,' m');$('velocity').textContent=fmt(s.velocity,2,' m/s');$('euler').textContent=fmt(s.euler,1,'°');$('cal').textContent=s.imu_calibration==null?'—':'IMU '+(s.imu_calibration*100).toFixed(0)+'% · MAG '+(s.mag_calibration*100).toFixed(0)+'%';$('parser').textContent=`CRC ${s.parser.crc} · bozuk ${s.parser.malformed} · gap ${s.parser.gaps} · drop ${s.parser.discarded}B`;canvas('route',s.route,'#39d7ff',true);canvas('chart',s.speed_history,'#ffbd4a')}catch(e){$('online').textContent='BAĞLANTI YOK';$('online').className='badge'}}
+async function update(){try{let r=await fetch('/api/status',{cache:'no-store'}),s=await r.json();$('online').textContent=s.online?'CANLI':'ÇEVRİMDIŞI';$('online').className='badge '+(s.online?'on':'');$('status').textContent=s.status;$('rate').textContent=s.rate_hz.toFixed(1)+' Hz';$('speed').textContent=s.speed_mps==null?'—':s.speed_mps.toFixed(2)+' m/s';$('distance').textContent=s.distance_m==null?'—':s.distance_m.toFixed(2)+' m';$('temp').textContent=s.temperature_c==null?'—':s.temperature_c.toFixed(1)+' °C';$('position').textContent=fmt(s.position,2,' m');$('velocity').textContent=fmt(s.velocity,2,' m/s');$('euler').textContent=fmt(s.euler,1,'°');$('cal').textContent=s.imu_calibration==null?'—':'IMU '+(s.imu_calibration*100).toFixed(0)+'% · MAG '+(s.mag_calibration*100).toFixed(0)+'%';$('parser').textContent=`CRC ${s.parser.crc} · bozuk ${s.parser.malformed} · gap ${s.parser.gaps} · drop ${s.parser.discarded}B`;$('cameraCard').style.display=s.camera.enabled?'block':'none';$('cameraStatus').textContent=s.camera.status+(s.camera.online?` · ${s.camera.width}×${s.camera.height} @ ${s.camera.fps} FPS`:'');canvas('route',s.route,'#39d7ff',true);canvas('chart',s.speed_history,'#ffbd4a')}catch(e){$('online').textContent='BAĞLANTI YOK';$('online').className='badge'}}
 async function resetNav(){if(confirm('Rota ve navigasyon durumu sıfırlansın mı?'))await fetch('/api/reset',{method:'POST'})}update();setInterval(update,500);addEventListener('resize',update);
 </script></body></html>"""
